@@ -236,13 +236,15 @@
 (defclass game ()
   ((players :accessor players)
    (hand :accessor hand)
+   (table :accessor table)
    (dealer :initform 0)))
 
 
 (defclass player ()
-  ((all-in :initform nil :accessor all-in)
+  ((all-in :accessor all-in)
    (best-hand :reader best-hand)
    (cards :initform '() :accessor cards)
+   (folded :accessor folded)
    (hand-rank :reader hand-rank)
    (name :initarg :name :accessor name)
    (stack :initarg :stack :initform 0 :accessor stack)
@@ -251,17 +253,22 @@
 
 (defclass hand ()
   ((community-cards :accessor community-cards)
-   (dealer :initarg :dealer :accessor dealer)
+   (dealer :initarg :dealer :reader dealer)
    (players :initarg :players :accessor players)
-   (pot :initform 0 :accessor pot)))
+   (pot :initform 0 :accessor pot)
+   (stake :initarg :stake :reader stake)))
 
 
 (defun player-at (pos players)
   (nth (rem pos (length players)) players))
 
 
-(defmethod best-hand ((player player) community-cards)
+(defmethod calculate-best-hand ((player player) community-cards)
   (first (ranked-hands (possible-hands (cons (cards player) community-cards)))))
+
+
+(defmethod fold ((player player))
+  (setf (folded player) t))
 
 
 (defmethod spend ((player player) amount)
@@ -281,28 +288,146 @@
 
 
 (defmethod start-hand ((player player))
-  (setf (all-in player) nil)
-  (setf (best-hand player) nil)
-  (setf (hand-rank player) nil)
-  (setf (cards player) '())
-  (setf (stake player) 0))
+  (with-slots (all-in best-hand cards folded hand-rank stake) player
+    (setf all-in nil)
+    (setf best-hand nil)
+    (setf folded nil)
+    (setf hand-rank nil)
+    (setf cards '())
+    (setf stake 0)))
 
 
-(defun betting-round (hand &key (stake 0) (start 0))
-  ; a. foreach player from big blind + 1
-  ; b. fold, check, call or raise
-  ; c. if all but one folded - last player wins
-  ; d. until all players either folded, checked, called or all-in
-  (dotimes (i (length (players hand)))
-    (let* ((player (player-at (+ start i) (players hand)))
-           (action (prompt player stake))
-           (amount-to-call (- stake (stake player))))
+(defmethod prompt ((player player) stake)
+  (let ((amount-to-call (- stake (stake player)))
+        ; a player can always fold
+        (options '(fold))
+        action
+        amount)
+    ; if the amount to call is greater than or equal to the player's stack, then
+    ; they can only go all-in
+    (if (>= amount-to-call (stack player))
+      (push 'all-in options)
+      ; otherwise, if the amount to call is zero, they can check
+      (progn
+        (if (zerop amount-to-call)
+          (push 'check options)
+          ; otherwise, they can call
+          (push 'call options))
+        ; and they can raise
+        (push 'raise options)))
+    (do () (nil)
+      (format t "~%~a to act: ~{~#[~;~a~;~a or ~a~:;~@{~a~#[~;, or ~:;, ~]~}~]~}"
+              (name player) options)
+      (setf action (read))
+      (when (member action options)
+        (return))
+      (format t "~%You can't ~a~%" action))
+    (when (eq action 'raise)
+      (do () (nil)
+        (format t "~%Raise amount (min: ~a)?~%" stake)
+        (setf amount (read))
+        (when (and (integerp amount)
+                   (> amount amount-to-call))
+          (return))))
+    (list action amount)))
+
+
+(defmethod update-stake ((hand hand) amount)
+  (when (> amount (stake hand))
+    (setf (stake hand) amount)))
+
+
+(defun act (player hand)
+  ; can't act if already all-in or folded
+  (unless (or (all-in player) (folded player))
+    ; prompt player to bet or fold
+    (destructuring-bind (action amount) (prompt player (stake hand))
       (cond
-        ((eq (first action) 'fold) (setf (players hand)
-                                         (remove player (players hand))))
-        ((eq (first action) 'call) (incf (pot hand) (spend player amount-to-call)))
-        ((eq (first action) 'bet) (let* ((amount (second action))
-                                         (raise (- amount amount-to-call)))))))))
+        ((eq action 'fold) (fold player))
+        ((eq action 'bet)  (incf (pot hand) (spend player amount))
+                           (update-stake hand amount))))))
+
+
+(defclass table ()
+  ((dealer :initarg :dealer)
+   (num-players :initform 0)
+   (num-seats :initform 10)
+   (seats)))
+
+
+(defmethod initialize-instance :after ((table table) &rest initargs)
+  (declare (ignore initargs))
+  (with-slots (num-seats seats) table
+    (setf seats (make-list num-seats))))
+
+
+(defmethod seat-number ((table table) n)
+  (rem n (slot-value table 'num-seats)))
+
+(defmethod take-seat ((player player) (table table) &key (start 0))
+  (with-slots (dealer num-players num-seats seats) table
+    (unless (>= num-players num-seats)
+      (do* ((start (seat-number table start))
+            (i start (seat-number table (1+ i)))
+            (tries 0))
+           ((and (> tries 0) (= i start)))
+        (unless (elt seats i)
+          (setf (elt seats i) player)
+          (incf num-players)
+          (return))
+        (incf tries)))))
+
+
+(defmethod orbit ((table table) &key (start 0))
+  (reverse
+    (do* ((start (seat-number table start))
+          (i start (seat-number table (1+ i)))
+          (started nil)
+          (players))
+         ((and started (= i start)) players)
+      (setf started t)
+      (push (elt (slot-value table 'seats) i) players))))
+
+
+(defmethod betting-round ((hand hand) &key (pre-flop nil))
+  (with-slots (dealer pot stake) hand
+    (let ((big-blind-is-live t)
+          (players (copy-list (players hand))))
+      ; make circular list
+      (setf (cdr (last players)) players)
+      ; foreach player from start
+      (setf players (nthcdr (+ (if pre-flop 3 1) dealer) players))
+      (dolist (player players)
+      ; (do* ((pos (rem (+ (if pre-flop 3 1) dealer) (length players))
+      ;            (rem (incf pos) (length players))))
+           ; if all but one folded - last player wins
+           ; ((= 1 (- (length (remove-if #'folded players)))))
+        ; (setf player (player-at pos players))
+        ; prompt player to bet or fold
+        (act player hand)
+        ; if all but one folded, last player wins
+        (when (length))
+        ; until all players either folded, all-in or called
+        (when (every (lambda (player)
+                        (or (folded player)
+                            (all-in player)
+                            (called player stake)))
+                     players)
+          ; if the big blind has yet to act, continue the round
+          (unless big-blind-is-live
+            (return))
+          (setf big-blind-is-live nil)
+          (format t "big blind has acted")))
+      ; remove folded players from hand
+      (setf players (set-difference players folded))))
+  'betting-ends)
+
+
+(let* ((players (list (make-instance 'player :name "alice" :stack 100)
+                     (make-instance 'player :name "bob" :stack 100)
+                     (make-instance 'player :name "carol" :stack 100)))
+       (hand (make-instance 'hand :dealer 0 :players players :stake 10)))
+  (betting-round hand))
 
 
 (defun distribute (pot players)
@@ -336,36 +461,38 @@
                                  players)))))
 
 
-(defmethod play ((hand hand) &key (deck (shuffle (deck))) &aux (pot 0))
-  ; play through a hand of poker
-  (with-slots (community-cards dealer players stake) hand
-    (mapc #'start-hand players)
+(defmethod play ((hand hand) &key (deck (shuffle (deck))))
+  (block play-hand
+    ; play through a hand of poker
+    (with-slots (community-cards dealer players pot stake) hand
+      (mapc #'start-hand players)
 
-    ; deal the hole cards
-    (dotimes (i *num-hole-cards*)
-      (dolist (player players)
-        (push (pop deck) (cards player))))
+      ; deal the hole cards
+      (dotimes (i *num-hole-cards*)
+        (dolist (player players)
+          (push (pop deck) (cards player))))
 
-    ; post blinds
-    (incf pot (spend (player-at (+ dealer 1) players) (/ stake 2)))
-    (incf pot (spend (player-at (+ dealer 2) players) stake))
+      ; post blinds
+      (incf pot (spend (player-at (+ dealer 1) players) (/ stake 2)))
+      (incf pot (spend (player-at (+ dealer 2) players) stake))
 
-    ; pre-flop betting
-    (betting-round hand :pre-flop t)
-    (when (= (length players) 1)
-      (return (win hand (first players))))
-
-    ; flop, turn and river
-    (dolist (num-cards '(3 1 1)) flop-turn-river
-      ; deal
-      (dotimes (i num-cards)
-        (push (pop deck) community-cards))
-      ; bet
-      (betting-round hand)
-      ; if all but one players fold, we have a winner
+      ; pre-flop betting
+      (betting-round hand :pre-flop t)
       (when (= (length players) 1)
-        (return (win hand (first players)))))
+        (return (distribute pot players)))
 
-    ; showdown
-    (distribute pot players)))
+      ; flop, turn and river
+      (dolist (num-cards '(3 1 1))
+        ; deal
+        (dotimes (i num-cards)
+          (push (pop deck) community-cards))
+        ; bet
+        (betting-round hand)
+        ; if all but one players fold, we have a winner
+        (when (= (length players) 1)
+          (return-from play-hand (distribute pot players))))
+
+      ; showdown
+      (mapc #'calculate-best-hand players)
+      (distribute pot players))))
 
