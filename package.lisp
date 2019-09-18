@@ -1,0 +1,2 @@
+(defpackage #:poker
+  (:use :cl))
